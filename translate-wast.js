@@ -33,7 +33,7 @@ function main() {
             // This turns into an instance definition
             last_module = tokens.collect();
             print("var ins = new WebAssembly.Instance(new WebAssembly.Module(wasmTextToBinary(`" +
-                  last_module.join(' ') +
+                  formatModule(last_module) +
                   "`)));");
         } else if (tokens.peek(['(', 'assert_return', '(', 'invoke'])) {
             // (assert_return (invoke fn arg ...) result ...)
@@ -147,8 +147,19 @@ ${must_reduce ? "(i8x16.all_true (local.get $cmpresult))" : "(local.get $cmpresu
                 print("if (!thrown) throw 'Error: expected exception';");
             }
         } else if (tokens.peek(['(', 'assert_malformed'])) {
-            // Syntax failure - not hard
-            tokens.collect();
+            let ts = new Tokens(tokens.collect());
+            ts.skip(2);
+            let m = ts.collect();
+            let err = ts.matchString();
+            ts.match([')']);
+            assertEq(ts.atEnd(), true);
+            print("var thrown = false;");
+            print("var saved;");
+            print("try { wasmTextToBinary(`");
+            print(formatModule(m));
+            print("`) } catch (e) { thrown = true; saved = e; }");
+            print("assertEq(thrown, true)");
+            print("assertEq(saved instanceof SyntaxError, true)");
         } else if (tokens.peek(['(', 'assert_invalid'])) {
             // Validation failure - not hard
             tokens.collect();
@@ -177,6 +188,26 @@ function parseInvoke(invoke_toks) {
     let fn_param_types = fn_params.map(paramType);
 
     return [fn_name, fn_params, fn_param_types];
+}
+
+function formatModule(ts) {
+    let m = new Tokens(ts);
+    m.match(['(', 'module']);
+    if (m.peek(['quote'])) {
+        m.get();
+        let ss = "(module ";
+        while (!m.peek([')'])) {
+            let s = m.get();
+            assertEq(s[0], '"');
+            assertEq(s[s.length-1], '"');
+            ss += "\n";
+            ss += s.substring(1, s.length-1);
+        }
+        ss += ")";
+        return ss;
+    } else {
+        return ts.join(' ');
+    }
 }
 
 function tokenize(s) {
