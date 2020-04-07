@@ -1,7 +1,11 @@
-// A shell script around this code must do two things:
+// Translate .wast files to JS for the SpiderMonkey shell.
+//
+// This script is itself for the SpiderMonkey shell.
+//
+// A regular shell script around this code must do two things:
 //
 //  - Set a global variable called INPUT_FILE with the name of the input file
-//  - Capture the output
+//  - Capture the output in an output file, this script writes to stdout
 
 function main() {
     if (!this.INPUT_FILE) {
@@ -11,60 +15,172 @@ function main() {
 
     let input = os.file.readFile(INPUT_FILE);
 
-    let tokens = new TokStream(tokenize(input));
+    let tokens = new Tokens(tokenize(input));
+    let last_module = null;
     while (!tokens.atEnd()) {
         if (tokens.peek(['(', 'module'])) {
             // This turns into an instance definition
-            print("var ins = new WebAssembly.Instance(new WebAssembly.Module(wasmTextToBinary(`" + tokens.collect().join(' ') + "`)));");
+            last_module = tokens.collect();
+            print("var ins = new WebAssembly.Instance(new WebAssembly.Module(wasmTextToBinary(`" +
+                  last_module.join(' ') +
+                  "`)));");
         } else if (tokens.peek(['(', 'assert_return', '(', 'invoke'])) {
-            let ts = new TokStream(tokens.collect());
+            // (assert_return (invoke fn arg ...) result ...)
+            // where each arg and each result is a const
+            // and the fn is bound by the preceding module
+            let ts = new Tokens(tokens.collect());
             ts.match(['(', 'assert_return']);
-            let invoke_toks = new TokStream(ts.collect());
-            let result_toks = new TokStream(ts.collect());
+            let invoke_toks = new Tokens(ts.collect());
+            let result_toks = new Tokens(ts.collect());
             ts.match([')']);
             assertEq(ts.atEnd(), true);
 
-            invoke_toks.match(['(', 'invoke']);
-            let fn_name = invoke_toks.get();
-            let fn_params = [];
-            while (!invoke_toks.peek([')']))
-                fn_params.push(invoke_toks.collect());
-            invoke_toks.match([')']);
-            let fn_param_types = fn_params.map((x) => get_type_from_const(x[1]));
+            let [fn_name, fn_params, fn_param_types] = parseInvoke(invoke_toks);
 
             let fn_results = [];
             while (!result_toks.atEnd())
                 fn_results.push(result_toks.collect());
-            let fn_result_types = fn_results.map((x) => get_type_from_const(x[1]));
+            let fn_result_types = fn_results.map((x) => constType(x[1]));
 
-            // TODO: Only one result for now
-            assertEq(fn_result_types.length <= 1, true);
-            let fn_compare_type = fn_result_types[0] == 'v128' ? 'i8x16' : fn_result_types[0];
-
-            print("var run = new WebAssembly.Instance(new WebAssembly.Module(wasmTextToBinary(`");
-            print(`
+            let mod = "";
+            if (fn_result_types.length == 0) {
+                mod = `
+(module
+  (import "" ${fn_name} (func $f (param ${fn_param_types.join(' ')})))
+  (func (export "run") (result i32)
+    (call $f ${fn_params.flat().map(sanitizeVal).join(' ')})
+    (i32.const 1)))
+`;
+            } else if (fn_result_types.length == 1) {
+                // I don't think this is right.  We're always going to see 'v128.const' for SIMD values here, since the
+                // type tag follows the initial token.  For integer SIMD types we can then go directly to T.eq.
+                // For floating types, we must look at the desired result value.  If any of the results are NaN
+                // we must generate a more elaborate comparison that amounts to !(x == x) for those lanes where the
+                // expected result is NaN.
+                let fn_compare_type = fn_result_types[0] == 'v128' ? 'i8x16' : fn_result_types[0];
+                let must_reduce = fn_compare_type.match('x');
+                let invoke = `(${fn_compare_type}.eq (call $f ${fn_params.flat().map(sanitizeVal).join(' ')}) ${fn_results[0].map(sanitizeVal).join(' ')})`;
+                let body = must_reduce ? `(${fn_compare_type}.all_true ${invoke})` : invoke;
+                mod = `
 (module
   (import "" ${fn_name} (func $f (param ${fn_param_types.join(' ')}) (result ${fn_result_types.join(' ')})))
-  (func (export "run") (result i32)
-    (${fn_compare_type}.all_true (${fn_compare_type}.eq (call $f ${fn_params.map((x) => x.join(' '))}) ${fn_results[0].join(' ')}))))
-`);
+  (func (export "run") (result i32) ${body}))
+`;
+            } else {
+                // TODO: Multi-result
+            }
+
+            print("var run = new WebAssembly.Instance(new WebAssembly.Module(wasmTextToBinary(`");
+            print(mod);
             print("`)), {'':ins.exports});");
             print("assertEq(run.exports.run(), 1)");
-        } else {
-            break;
-        }
-        /*
-          } else if (p.indexOf('(assert_trap (invoke') == 0) {
-          // Basically the same but we need to setup an exception handler and expect
-          // the exception, we'll ignore the error message
-          } else if (p.indexOf('(assert_malformed') == 0) {
-          // Syntax failure
-          } else if (p.indexOf('(assert_invalid') == 0) {
-          // Validation failure
-          }
-        */
+        } else if (tokens.peek(['(', 'assert_trap', '(', 'invoke'])) {
+            // (assert_trap (invoke fn arg ...) errormsg)
+            // where each arg is a const
+            // and the fn is bound by the preceding module
+            let ts = new Tokens(tokens.collect());
+            ts.match(['(', 'assert_trap']);
+            let invoke_toks = new Tokens(ts.collect());
+            let error_msg = ts.matchString();
+            ts.match([')']);
+            assertEq(ts.atEnd(), true);
 
+            let [fn_name, fn_params, fn_param_types] = parseInvoke(invoke_toks);
+
+            // TODO: the "drop" is wrong because we don't know that it's
+            // correct.  To do better we have to find and parse the callee.  Not
+            // the end of the world, but annoying.
+            if (false) {
+                print("var run = new WebAssembly.Instance(new WebAssembly.Module(wasmTextToBinary(`");
+                print(`
+(module
+  (import "" ${fn_name} (func $f (param ${fn_param_types.join(' ')})))
+  (func (export "run")
+    (drop (call $f ${fn_params.flat().join(' ')}))))
+`);
+                print("`)), {'':ins.exports});");
+                print("var thrown = false;");
+                print("try { run.exports.run() } catch (e) { thrown = true; }");
+                print("if (!thrown) throw 'Error: expected exception';");
+            }
+        } else if (tokens.peek(['(', 'assert_malformed'])) {
+            // Syntax failure - not hard
+            tokens.collect();
+        } else if (tokens.peek(['(', 'assert_invalid'])) {
+            // Validation failure - not hard
+            tokens.collect();
+        } else {
+            throw "Unexpected phrase: " + tokens.peekPrefix(10);
+        }
     }
+}
+
+// Not obvious that this is what we want but these values appearing in the test
+// suite are not standard, from what I can tell.
+function sanitizeVal(v) {
+    if (v == "nan:canonical") return "nan";
+    if (v == "nan:arithmetic") return "nan";
+    return v;
+}
+
+function parseInvoke(invoke_toks) {
+    invoke_toks.match(['(', 'invoke']);
+    let fn_name = invoke_toks.matchString();
+    let fn_params = [];
+    while (!invoke_toks.peek([')']))
+        fn_params.push(invoke_toks.collect());
+    invoke_toks.match([')']);
+    assertEq(invoke_toks.atEnd(), true);
+    let fn_param_types = fn_params.map((x) => constType(x[1]));
+
+    return [fn_name, fn_params, fn_param_types];
+}
+
+function tokenize(s) {
+    let i = 0;
+    let len = s.length;
+    let tokens = [];
+    while (i < len) {
+        if (!issep(s[i])) {
+            let x = s[i++];
+            while (i < len && !issep(s[i]))
+                x += s[i++];
+            tokens.push(x);
+        } else {
+            switch (s[i]) {
+            case ' ': case '\t': case '\r': case '\n':
+                i++;
+                continue;
+            case ';':
+                i++;
+                while (i < len && !(s[i] == '\r' || s[i] == '\n'))
+                    i++;
+                continue;
+            case '(':
+            case ')':
+                tokens.push(s[i++]);
+                continue;
+            case '"': {
+                let x = s[i++];
+                while (i < len && s[i] != '"') {
+                    let c = s[i++];
+                    x += c;
+                    if (c == '\\') {
+                        x += '\\';
+                    }
+                }
+                if (i < len)
+                    x += s[i++];
+                tokens.push(x);
+                continue;
+            }
+            default:
+                print("Error: internal inconsistency");
+                exit(1);
+            }
+        }
+    }
+    return tokens;
 }
 
 function isxdigit(c) {
@@ -81,113 +197,92 @@ function isxdigit(c) {
     }
 }
 
-function tokenize(s) {
-    let i = 0;
-    let len = s.length;
-    let tokens = [];
-    while (i < len) {
-        switch (s[i]) {
-        case ' ': case '\t': case '\r': case '\n':
-            i++;
-            continue;
-        case ';':
-            i++;
-            while (i < len && !(s[i] == '\r' || s[i] == '\n'))
-                i++;
-            continue;
-        case '(':
-        case ')':
-            tokens.push(s[i++]);
-            continue;
-        case '"': {
-            let x = s[i++];
-            while (i < len && s[i] != '"') {
-                let c = s[i++];
-                x += c;
-                if (c == '\\') {
-                    x += '\\';
-                }
-            }
-            if (i < len)
-                x += s[i++];
-            tokens.push(x);
-            continue;
-        }
-        default: {
-            let x = s[i++];
-            loop:
-            while (i < len) {
-                switch (s[i]) {
-                case ' ': case '\t': case '\n': case '\r':
-                case ';':
-                case '(':
-                case ')':
-                case '"':
-                    break loop;
-                default:
-                    x += s[i++];
-                    break;
-                }
-            }
-            tokens.push(x);
-            continue;
-        }
-        }
+function issep(c) {
+    switch (c) {
+    case ' ': case '\t': case '\n': case '\r':
+    case ';':
+    case '(':
+    case ')':
+    case '"':
+        return true;
+    default:
+        return false;
     }
-    return tokens;
 }
 
-function get_type_from_const(s) {
+function constType(s) {
     return s.match(/([ifv]\d+)\.const/)[1];
 }
 
-function TokStream(tokens) {
-    this.tokens = tokens;
-    this.i = 0;
-    this.lim = tokens.length;
-}
-
-TokStream.prototype.atEnd = function () {
-    return this.i >= this.lim;
-}
-
-TokStream.prototype.get = function () {
-    assertEq(this.i < this.lim, true);
-    return this.tokens[this.i++];
-}
-
-TokStream.prototype.peek = function (ts) {
-    for ( let i=0 ; i < ts.length ; i++ ) {
-        if (ts[i] != this.tokens[this.i+i])
-            return false;
+class Tokens {
+    constructor (tokens) {
+        this.tokens = tokens;
+        this.i = 0;
+        this.lim = tokens.length;
     }
-    return true;
-}
-
-TokStream.prototype.match = function (ts) {
-    if (!this.peek(ts))
-        throw "Did not match: " + ts.join(' ');
-    this.skip(ts.length);
-}
-
-TokStream.prototype.skip = function (n) {
-    this.i += n;
-}
-
-TokStream.prototype.collect = function () {
-    assertEq(this.tokens[this.i], '(');
-    let ts = ['('];
-    let d = 1;
-    this.i++;
-    while (this.i < this.lim && d > 0) {
-        ts.push(this.tokens[this.i]);
-        if (this.tokens[this.i] == '(')
-            d++;
-        else if (this.tokens[this.i] == ')')
-            d--;
+    atEnd() {
+        return this.i >= this.lim;
+    }
+    get() {
+        this.assertAvail(1);
+        return this.tokens[this.i++];
+    }
+    peek(ts) {
+        for ( let i=0 ; i < ts.length ; i++ ) {
+            if (ts[i] != this.tokens[this.i+i])
+                return false;
+        }
+        return true;
+    }
+    peekPrefix(n) {
+        let ts = [];
+        let i = this.i;
+        while (n > 0 && i < this.lim) {
+            ts.push(this.tokens[i++]);
+            n--;
+        }
+        return ts;
+    }
+    match(ts) {
+        if (!this.peek(ts))
+            throw "Did not match: " + ts.join(' ');
+        this.skip(ts.length);
+    }
+    matchString() {
+        this.assertAvail(1);
+        let t = this.tokens[this.i];
+        this.assertEq('"', t[0]);
         this.i++;
+        return t;
     }
-    return ts;
+    skip(n) {
+        this.i += n;
+    }
+    collect() {
+        if (this.peek([')']))
+            return [];
+        this.assertEq('(', this.tokens[this.i]);
+        let ts = ['('];
+        let d = 1;
+        this.i++;
+        while (this.i < this.lim && d > 0) {
+            ts.push(this.tokens[this.i]);
+            if (this.tokens[this.i] == '(')
+                d++;
+            else if (this.tokens[this.i] == ')')
+                d--;
+            this.i++;
+        }
+        return ts;
+    }
+    assertEq(expected, got) {
+        if (got != expected)
+            throw "Expected to see " + expected + " but got " + got;
+    }
+    assertAvail(n) {
+        if (this.i + n > this.lim)
+            throw "Not enough tokens: " + n;
+    }
 }
 
 main();
