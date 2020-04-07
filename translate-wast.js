@@ -1,4 +1,5 @@
-// Translate .wast files to JS for the SpiderMonkey shell.
+// Translate .wast files to JS for the SpiderMonkey shell, without requiring a
+// wast interpreter.  This is a bit of a hack but it mostly works.
 //
 // This script is itself for the SpiderMonkey shell.
 //
@@ -6,6 +7,16 @@
 //
 //  - Set a global variable called INPUT_FILE with the name of the input file
 //  - Capture the output in an output file, this script writes to stdout
+
+// TODO list in priority order
+//  - implement support for NaN (knotty, at least)
+//  - general support for "module quote", which will go a long way toward
+//    supporting assert_malformed
+//  - implement support for assert_malformed and assert_invalid (not hard)
+//  - implement support for assert_trap (requires more elaborate module parsing to
+//    obtain the return type so as to know whether to drop a result or not)
+//  - try to get rid of the hack around nan:canonical and nan:arithmetic, if
+//    possible
 
 function main() {
     if (!this.INPUT_FILE) {
@@ -70,10 +81,28 @@ function main() {
                 // patterns right.
                 let fn_compare_type = compareType(fn_results[0]);
                 let must_reduce = fn_compare_type.match('x');
+                let has_nan = fn_results[0].some((x) => x.match(/nan/));
+                let mask = "";
+                if (has_nan) {
+                    // In this case, use i32x4 to compare for vector, but note
+                    // results can also be scalar.  Compute a mask to apply to
+                    // the result to clean up NaN values.  The mask is 1 for
+                    // non-NaN and for the significant bits of the NaN but 0 for
+                    // the NaN sign and payload.
+
+                    // TODO: Implement
+                    continue;
+                    fn_compare_type = 'i32x4'; // Maybe
+                }
                 if (fn_compare_type == 'i64x2')
                     fn_compare_type = 'i32x4';
-                let invoke = `(${fn_compare_type}.eq (call $f ${fn_params.flat().map(sanitizeVal).join(' ')}) ${fn_results[0].map(sanitizeVal).join(' ')})`;
-                let body = must_reduce ? `(i8x16.all_true ${invoke})` : invoke;
+                let body = `
+(local $result ${fn_result_types[0]})
+(local $cmpresult ${must_reduce ? "v128" : "i32"})
+(local.set $result (call $f ${fn_params.flat().map(sanitizeVal).join(' ')}))
+${mask}
+(local.set $cmpresult (${fn_compare_type}.eq (local.get $result) ${fn_results[0].map(sanitizeVal).join(' ')}))
+${must_reduce ? "(i8x16.all_true (local.get $cmpresult))" : "(local.get $cmpresult)"}`;
                 mod = `
 (module
   (import "" ${fn_name} (func $f (param ${fn_param_types.join(' ')}) (result ${fn_result_types.join(' ')})))
