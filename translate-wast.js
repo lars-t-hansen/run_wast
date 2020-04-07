@@ -40,7 +40,7 @@ function main() {
             let fn_results = [];
             while (!result_toks.atEnd())
                 fn_results.push(result_toks.collect());
-            let fn_result_types = fn_results.map((x) => constType(x[1]));
+            let fn_result_types = fn_results.map(resultType);
 
             let mod = "";
             if (fn_result_types.length == 0) {
@@ -52,15 +52,28 @@ function main() {
     (i32.const 1)))
 `;
             } else if (fn_result_types.length == 1) {
-                // I don't think this is right.  We're always going to see 'v128.const' for SIMD values here, since the
-                // type tag follows the initial token.  For integer SIMD types we can then go directly to T.eq.
-                // For floating types, we must look at the desired result value.  If any of the results are NaN
-                // we must generate a more elaborate comparison that amounts to !(x == x) for those lanes where the
-                // expected result is NaN.
-                let fn_compare_type = fn_result_types[0] == 'v128' ? 'i8x16' : fn_result_types[0];
+                // Comparisons and reductions are a little hacky.  We prefer the
+                // type-specific comparisons when we can, but we have no
+                // i64x2.eq, so we use i32x4.eq in this case; it is correct to
+                // do so.
+                //
+                // When the comparisons are not scalar we must reduce the result
+                // to a scalar.  Reductions are similar to compares: there are
+                // restrictions.  We have no i64x2.all_true, for example, and
+                // none for the floats anyway.  But we can always use i8x16 to
+                // reduce because we know a lane is either 0 or -1, and if we
+                // really mean all_true then we really mean all_bits_set here.
+                //
+                // The following is not right for NaN.  In that case we must
+                // either do !(x == x) for the possibly-NaN fields, or we must
+                // drop down to integer compares if we're sure we got the bit
+                // patterns right.
+                let fn_compare_type = compareType(fn_results[0]);
                 let must_reduce = fn_compare_type.match('x');
+                if (fn_compare_type == 'i64x2')
+                    fn_compare_type = 'i32x4';
                 let invoke = `(${fn_compare_type}.eq (call $f ${fn_params.flat().map(sanitizeVal).join(' ')}) ${fn_results[0].map(sanitizeVal).join(' ')})`;
-                let body = must_reduce ? `(${fn_compare_type}.all_true ${invoke})` : invoke;
+                let body = must_reduce ? `(i8x16.all_true ${invoke})` : invoke;
                 mod = `
 (module
   (import "" ${fn_name} (func $f (param ${fn_param_types.join(' ')}) (result ${fn_result_types.join(' ')})))
@@ -68,6 +81,7 @@ function main() {
 `;
             } else {
                 // TODO: Multi-result
+                throw "Multi-result not implemented"
             }
 
             print("var run = new WebAssembly.Instance(new WebAssembly.Module(wasmTextToBinary(`");
@@ -131,7 +145,7 @@ function parseInvoke(invoke_toks) {
         fn_params.push(invoke_toks.collect());
     invoke_toks.match([')']);
     assertEq(invoke_toks.atEnd(), true);
-    let fn_param_types = fn_params.map((x) => constType(x[1]));
+    let fn_param_types = fn_params.map(paramType);
 
     return [fn_name, fn_params, fn_param_types];
 }
@@ -210,8 +224,39 @@ function issep(c) {
     }
 }
 
-function constType(s) {
-    return s.match(/([ifv]\d+)\.const/)[1];
+// The input here is ( token ... ) since for v128 consts the type is actually
+// the second token.
+
+function compareType(ct) {
+    let ts = new Tokens(ct);
+    ts.match(['(']);
+    let c = ts.get();
+    switch (c) {
+    case 'i32.const': return 'i32';
+    case 'i64.const': return 'i64';
+    case 'f32.const': return 'f32';
+    case 'f64.const': return 'f64';
+    case 'v128.const': return ts.get();
+    default: throw "Unexpected const token " + c;
+    }
+}
+
+function paramType(ct) {
+    let ts = new Tokens(ct);
+    ts.match(['(']);
+    let c = ts.get();
+    switch (c) {
+    case 'i32.const': return 'i32';
+    case 'i64.const': return 'i64';
+    case 'f32.const': return 'f32';
+    case 'f64.const': return 'f64';
+    case 'v128.const': return 'v128';
+    default: throw "Unexpected const token " + c;
+    }
+}
+
+function resultType(ct) {
+    return paramType(ct);
 }
 
 class Tokens {
