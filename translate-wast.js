@@ -10,9 +10,6 @@
 
 // TODO list in priority order
 //  - implement support for NaN (knotty, at least)
-//  - general support for "module quote", which will go a long way toward
-//    supporting assert_malformed
-//  - implement support for assert_malformed and assert_invalid (not hard)
 //  - implement support for assert_trap (requires more elaborate module parsing to
 //    obtain the return type so as to know whether to drop a result or not)
 //  - try to get rid of the hack around nan:canonical and nan:arithmetic, if
@@ -147,6 +144,7 @@ ${must_reduce ? "(i8x16.all_true (local.get $cmpresult))" : "(local.get $cmpresu
                 print("if (!thrown) throw 'Error: expected exception';");
             }
         } else if (tokens.peek(['(', 'assert_malformed'])) {
+            // (assert_malformed module error)
             let ts = new Tokens(tokens.collect());
             ts.skip(2);
             let m = ts.collect();
@@ -161,8 +159,22 @@ ${must_reduce ? "(i8x16.all_true (local.get $cmpresult))" : "(local.get $cmpresu
             print("assertEq(thrown, true)");
             print("assertEq(saved instanceof SyntaxError, true)");
         } else if (tokens.peek(['(', 'assert_invalid'])) {
-            // Validation failure - not hard
-            tokens.collect();
+            // (assert_invalid module error)
+            let ts = new Tokens(tokens.collect());
+            ts.skip(2);
+            let m = ts.collect();
+            let err = ts.matchString();
+            ts.match([')']);
+            assertEq(ts.atEnd(), true);
+            print("var thrown = false;");
+            print("var saved;");
+            print("var bin = wasmTextToBinary(`");
+            print(formatModule(m));
+            print("`);");
+            print("assertEq(WebAssembly.validate(bin), false);");
+            print("try { new WebAssembly.Module(bin) } catch (e) { thrown = true; saved = e; }");
+            print("assertEq(thrown, true)");
+            print("assertEq(saved instanceof WebAssembly.CompileError, true)");
         } else {
             throw "Unexpected phrase: " + tokens.peekPrefix(10);
         }
