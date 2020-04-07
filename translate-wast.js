@@ -15,8 +15,6 @@
 
 // TODO list in priority order
 //  - implement support for NaN (knotty, at least)
-//  - implement support for assert_trap (requires more elaborate module parsing to
-//    obtain the return type so as to know whether to drop a result or not)
 //  - try to get rid of the hack around nan:canonical and nan:arithmetic, if
 //    possible
 
@@ -30,10 +28,12 @@ function main() {
 
     let tokens = new Tokens(tokenize(input));
     let last_module = null;
+    let last_module_funcs = null;
     while (!tokens.atEnd()) {
         if (tokens.peek(['(', 'module'])) {
             // This turns into an instance definition
             last_module = tokens.collect();
+            last_module_funcs = null;
             print("var ins = new WebAssembly.Instance(new WebAssembly.Module(wasmTextToBinary(`" +
                   formatModule(last_module) +
                   "`)));");
@@ -129,24 +129,25 @@ ${must_reduce ? "(i8x16.all_true (local.get $cmpresult))" : "(local.get $cmpresu
             ts.match([')']);
             assertEq(ts.atEnd(), true);
 
-            let [fn_name, fn_params, fn_param_types] = parseInvoke(invoke_toks);
+            if (!last_module_funcs)
+                last_module_funcs = parseFunctions(last_module);
 
-            // TODO: the "drop" is wrong because we don't know that it's
-            // correct.  To do better we have to find and parse the callee.  Not
-            // the end of the world, but annoying.
-            if (false) {
-                print("var run = new WebAssembly.Instance(new WebAssembly.Module(wasmTextToBinary(`");
-                print(`
+            let [fn_name, fn_params, fn_param_types] = parseInvoke(invoke_toks);
+            let signature = last_module_funcs[stripString(fn_name)];
+
+            print("var run = new WebAssembly.Instance(new WebAssembly.Module(wasmTextToBinary(`");
+            print(`
 (module
-  (import "" ${fn_name} (func $f (param ${fn_param_types.join(' ')})))
+  (import "" ${fn_name} (func $f ${signature.params.length ? `(param ${signature.params.join(' ')})` : ''}
+                                 ${signature.results.length ? `(result ${signature.results.join(' ')})` : ''}))
   (func (export "run")
-    (drop (call $f ${fn_params.flat().join(' ')}))))
+    (call $f ${fn_params.flat().join(' ')})
+    ${signature.results.length > 0 ? 'drop' : ''}))
 `);
-                print("`)), {'':ins.exports});");
-                print("var thrown = false;");
-                print("try { run.exports.run() } catch (e) { thrown = true; }");
-                print("if (!thrown) throw 'Error: expected exception';");
-            }
+            print("`)), {'':ins.exports});");
+            print("var thrown = false;");
+            print("try { run.exports.run() } catch (e) { thrown = true; }");
+            print("if (!thrown) throw 'Error: expected exception';");
         } else if (tokens.peek(['(', 'assert_malformed'])) {
             // (assert_malformed module error)
             let ts = new Tokens(tokens.collect());
@@ -206,6 +207,44 @@ function parseInvoke(invoke_toks) {
     return [fn_name, fn_params, fn_param_types];
 }
 
+// Given the tokens for a module: returns a dictionary mapping function name
+// (without double quotes) to signature {params: [type], results: [type]}.
+
+function parseFunctions(ts) {
+    let signatures = {};
+    let m = new Tokens(ts);
+    m.match(['(', 'module']);
+    while (!m.peek([')'])) {
+        let next = new Tokens(m.collect());
+        if (next.peek(['(', 'func'])) {
+            next.skip(2);
+            let name_toks = new Tokens(next.collect());
+            if (!name_toks.peek(['(', 'export']))
+                continue;
+            name_toks.skip(2);
+            let name = stripString(name_toks.get());
+            let params = [];
+            while (next.peek(['(', 'param'])) {
+                next.skip(2);
+                while (!next.peek([')']))
+                    params.push(next.get());
+                next.skip(1);
+            }
+            let results = [];
+            while (next.peek(['(', 'result'])) {
+                next.skip(2);
+                while (!next.peek([')']))
+                    results.push(next.get());
+                next.skip(1);
+            }
+            signatures[name] = {params, results}
+        }
+    }
+    m.match([')']);
+    assertEq(m.atEnd(), true);
+    return signatures;
+}
+
 function formatModule(ts) {
     let m = new Tokens(ts);
     m.match(['(', 'module']);
@@ -213,17 +252,20 @@ function formatModule(ts) {
         m.get();
         let ss = "(module ";
         while (!m.peek([')'])) {
-            let s = m.get();
-            assertEq(s[0], '"');
-            assertEq(s[s.length-1], '"');
             ss += "\n";
-            ss += s.substring(1, s.length-1);
+            ss += stripString(m.get());
         }
         ss += ")";
         return ss;
     } else {
         return ts.join(' ');
     }
+}
+
+function stripString(s) {
+    assertEq(s[0], '"');
+    assertEq(s[s.length-1], '"');
+    return s.substring(1, s.length-1);
 }
 
 function tokenize(s) {
