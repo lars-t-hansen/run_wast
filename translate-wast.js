@@ -1,12 +1,17 @@
 // Translate .wast files to JS for the SpiderMonkey shell, without requiring a
-// wast interpreter.  This is a bit of a hack but it mostly works.
+// wast interpreter.  This is a bit of a hack but it mostly works for what I
+// need it for, which is converting the SIMD tests to JS.
 //
-// This script is itself for the SpiderMonkey shell.
+// This script is itself for the SpiderMonkey shell though probably only
+// os.file.readFile is shell-specific.
 //
 // A regular shell script around this code must do two things:
 //
 //  - Set a global variable called INPUT_FILE with the name of the input file
 //  - Capture the output in an output file, this script writes to stdout
+//
+// For more portable JS code, the shell script could read the input and provide
+// it in a global variable for this script to process.
 
 // TODO list in priority order
 //  - implement support for NaN (knotty, at least)
@@ -34,7 +39,7 @@ function main() {
                   "`)));");
         } else if (tokens.peek(['(', 'assert_return', '(', 'invoke'])) {
             // (assert_return (invoke fn arg ...) result ...)
-            // where each arg and each result is a const
+            // where each arg and each result is a T.const
             // and the fn is bound by the preceding module
             let ts = new Tokens(tokens.collect());
             ts.match(['(', 'assert_return']);
@@ -66,8 +71,7 @@ function main() {
                 // do so.
                 //
                 // When the comparisons are not scalar we must reduce the result
-                // to a scalar.  Reductions are similar to compares: there are
-                // restrictions.  We have no i64x2.all_true, for example, and
+                // to a scalar.  We have no i64x2.all_true, for example, and
                 // none for the floats anyway.  But we can always use i8x16 to
                 // reduce because we know a lane is either 0 or -1, and if we
                 // really mean all_true then we really mean all_bits_set here.
