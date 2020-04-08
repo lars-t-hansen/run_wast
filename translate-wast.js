@@ -2,41 +2,55 @@
 // wast interpreter.  This is a bit of a hack but it mostly works for what I
 // need it for, which is converting the SIMD tests to JS.
 //
-// This script is itself for the SpiderMonkey shell though probably only
-// os.file.readFile is shell-specific.
+// This script is itself for the SpiderMonkey shell though only the code in
+// main() is shell-specific.  All errors are signalled as exceptions.
 //
 // A regular shell script around this code must do two things:
 //
 //  - Set a global variable called INPUT_FILE with the name of the input file
 //  - Capture the output in an output file, this script writes to stdout
-//
-// For more portable JS code, the shell script could read the input and provide
-// it in a global variable for this script to process.
 
 // TODO list in priority order
 //  - implement support for NaN (knotty, at least)
 //  - try to get rid of the hack around nan:canonical and nan:arithmetic, if
 //    possible
+//  - emit comments with line numbers before each test, this requires
+//    maintaining some sort of association between the token stream and line
+//    numbers of the input, possibilities include: embedded line number tokens
+//    that are stripped by the Token abstraction; using a String object with
+//    an attached line number for each '(' token; always following each '('
+//    with a line number token and exposing this fact in the API.
 
 function main() {
-    if (!this.INPUT_FILE) {
-        print("Error: No input file");
-        exit(1);
-    }
-
+    if (!this.INPUT_FILE)
+        throw "Error: No input file";
     let input = os.file.readFile(INPUT_FILE);
+    let output = translate(input);
+    print(output);
+}
 
-    let tokens = new Tokens(tokenize(input));
+function translate(input) {
+    let output = "";
+    let out = function(...ss) {
+        for ( let s of ss ) {
+            output += s;
+            output += "\n";
+        }
+    };
+
     let last_module = null;
     let last_module_funcs = null;
+
+    let tokens = new Tokens(tokenize(input));
     while (!tokens.atEnd()) {
         if (tokens.peek(['(', 'module'])) {
-            // This turns into an instance definition
+            // (module ...)
+            // This turns into an instance definition for subsequent tests to reference.
             last_module = tokens.collect();
             last_module_funcs = null;
-            print("var ins = new WebAssembly.Instance(new WebAssembly.Module(wasmTextToBinary(`" +
-                  formatModule(last_module) +
-                  "`)));");
+            out("var ins = new WebAssembly.Instance(new WebAssembly.Module(wasmTextToBinary(`",
+                formatModule(last_module),
+                "`)));");
         } else if (tokens.peek(['(', 'assert_return', '(', 'invoke'])) {
             // (assert_return (invoke fn arg ...) result ...)
             // where each arg and each result is a T.const
@@ -114,10 +128,10 @@ ${must_reduce ? "(i8x16.all_true (local.get $cmpresult))" : "(local.get $cmpresu
                 throw "Multi-result not implemented"
             }
 
-            print("var run = new WebAssembly.Instance(new WebAssembly.Module(wasmTextToBinary(`");
-            print(mod);
-            print("`)), {'':ins.exports});");
-            print("assertEq(run.exports.run(), 1)");
+            out("var run = new WebAssembly.Instance(new WebAssembly.Module(wasmTextToBinary(`",
+                mod,
+                "`)), {'':ins.exports});",
+                "assertEq(run.exports.run(), 1)");
         } else if (tokens.peek(['(', 'assert_trap', '(', 'invoke'])) {
             // (assert_trap (invoke fn arg ...) errormsg)
             // where each arg is a const
@@ -135,19 +149,19 @@ ${must_reduce ? "(i8x16.all_true (local.get $cmpresult))" : "(local.get $cmpresu
             let [fn_name, fn_params, fn_param_types] = parseInvoke(invoke_toks);
             let signature = last_module_funcs[stripString(fn_name)];
 
-            print("var run = new WebAssembly.Instance(new WebAssembly.Module(wasmTextToBinary(`");
-            print(`
+            out("var run = new WebAssembly.Instance(new WebAssembly.Module(wasmTextToBinary(`",
+                `
 (module
   (import "" ${fn_name} (func $f ${signature.params.length ? `(param ${signature.params.join(' ')})` : ''}
                                  ${signature.results.length ? `(result ${signature.results.join(' ')})` : ''}))
   (func (export "run")
     (call $f ${fn_params.flat().join(' ')})
     ${signature.results.length > 0 ? 'drop' : ''}))
-`);
-            print("`)), {'':ins.exports});");
-            print("var thrown = false;");
-            print("try { run.exports.run() } catch (e) { thrown = true; }");
-            print("if (!thrown) throw 'Error: expected exception';");
+`,
+                "`)), {'':ins.exports});",
+                "var thrown = false;",
+                "try { run.exports.run() } catch (e) { thrown = true; }",
+                "if (!thrown) throw 'Error: expected exception';");
         } else if (tokens.peek(['(', 'assert_malformed'])) {
             // (assert_malformed module error)
             let ts = new Tokens(tokens.collect());
@@ -156,13 +170,13 @@ ${must_reduce ? "(i8x16.all_true (local.get $cmpresult))" : "(local.get $cmpresu
             let err = ts.matchString();
             ts.match([')']);
             assertEq(ts.atEnd(), true);
-            print("var thrown = false;");
-            print("var saved;");
-            print("try { wasmTextToBinary(`");
-            print(formatModule(m));
-            print("`) } catch (e) { thrown = true; saved = e; }");
-            print("assertEq(thrown, true)");
-            print("assertEq(saved instanceof SyntaxError, true)");
+            out("var thrown = false;",
+                "var saved;",
+                "try { wasmTextToBinary(`",
+                formatModule(m),
+                "`) } catch (e) { thrown = true; saved = e; }",
+                "assertEq(thrown, true)",
+                "assertEq(saved instanceof SyntaxError, true)");
         } else if (tokens.peek(['(', 'assert_invalid'])) {
             // (assert_invalid module error)
             let ts = new Tokens(tokens.collect());
@@ -171,19 +185,20 @@ ${must_reduce ? "(i8x16.all_true (local.get $cmpresult))" : "(local.get $cmpresu
             let err = ts.matchString();
             ts.match([')']);
             assertEq(ts.atEnd(), true);
-            print("var thrown = false;");
-            print("var saved;");
-            print("var bin = wasmTextToBinary(`");
-            print(formatModule(m));
-            print("`);");
-            print("assertEq(WebAssembly.validate(bin), false);");
-            print("try { new WebAssembly.Module(bin) } catch (e) { thrown = true; saved = e; }");
-            print("assertEq(thrown, true)");
-            print("assertEq(saved instanceof WebAssembly.CompileError, true)");
+            out("var thrown = false;",
+                "var saved;",
+                "var bin = wasmTextToBinary(`",
+                formatModule(m),
+                "`);",
+                "assertEq(WebAssembly.validate(bin), false);",
+                "try { new WebAssembly.Module(bin) } catch (e) { thrown = true; saved = e; }",
+                "assertEq(thrown, true)",
+                "assertEq(saved instanceof WebAssembly.CompileError, true)");
         } else {
             throw "Unexpected phrase: " + tokens.peekPrefix(10);
         }
     }
+    return output;
 }
 
 // Not obvious that this is what we want but these values appearing in the test
@@ -307,8 +322,7 @@ function tokenize(s) {
                 continue;
             }
             default:
-                print("Error: internal inconsistency");
-                exit(1);
+                throw "Error: internal inconsistency";
             }
         }
     }
