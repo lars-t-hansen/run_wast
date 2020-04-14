@@ -11,9 +11,7 @@
 //  - Capture the output in an output file, this script writes to stdout
 
 // TODO list in priority order
-//  - implement support for NaN (knotty, at least)
-//  - try to get rid of the hack around nan:canonical and nan:arithmetic, if
-//    possible
+//  - we can do better for NaN comparisons, comparing payloads at least.
 //  - emit comments with line numbers before each test, this requires
 //    maintaining some sort of association between the token stream and line
 //    numbers of the input, possibilities include: embedded line number tokens
@@ -90,33 +88,66 @@ function translate(input) {
                 // reduce because we know a lane is either 0 or -1, and if we
                 // really mean all_true then we really mean all_bits_set here.
                 //
-                // The following is not right for NaN.  In that case we must
-                // either do !(x == x) for the possibly-NaN fields, or we must
-                // drop down to integer compares if we're sure we got the bit
-                // patterns right.
-                let fn_compare_type = compareType(fn_results[0]);
-                let must_reduce = fn_compare_type.match('x');
-                let has_nan = fn_results[0].some((x) => x.match(/nan/));
+                // For NaN we mask the result and the expected value and compare
+                // as ints (thus ignoring sign and payload).  This is close
+                // enough to being right for now.
+                let [fn_compare_type, must_reduce, fn_compare_values] = parseConst(fn_results[0]);
+                let has_nan = fn_compare_values.some((x) => x.match(/nan/));
                 let mask = "";
-                if (has_nan) {
-                    // In this case, use i32x4 to compare for vector, but note
-                    // results can also be scalar.  Compute a mask to apply to
-                    // the result to clean up NaN values.  The mask is 1 for
-                    // non-NaN and for the significant bits of the NaN but 0 for
-                    // the NaN sign and payload.
+                let more_locals = "";
+                let cmp_suffix = "";
+                let fn_compare_op = "XXX";
 
-                    // TODO: Implement
-                    continue;
-                    fn_compare_type = 'i32x4'; // Maybe
+                if (has_nan) {
+                    let maskval = "";
+                    fn_compare_val = "";
+                    switch (fn_compare_type) {
+                    case 'f32x4':
+                    case 'f32':
+                        maskval = fn_compare_values.map((x) => x.match(/nan/) ? ' 0x7FC00000' : ' 0xFFFFFFFF').join(' ');
+                        fn_compare_op = must_reduce ? 'i32x4.eq' : 'i32.eq';
+                        break;
+                    case 'f64x2':
+                        maskval = fn_compare_values.map((x) => x.match(/nan/) ? ' 0x7FF80000 0' : ' 0xFFFFFFFF 0xFFFFFFFF').join(' ');
+                        fn_compare_op = 'i32x4.eq';
+                        break;
+                    case 'f64':
+                        maskval = fn_compare_values[0].match(/nan/) ? ' 0x7FF80000' : ' 0xFFFFFFFF';
+                        fn_compare_op = 'i64.eq';
+                        break;
+                    default:
+                        throw "Not an acceptable type for has_nan: " + fn_compare_type;
+                    }
+                    if (must_reduce) {
+                        maskval = `(v128.const i32x4 ${maskval})`;
+                        mask = `
+(local.set $result (v128.and (local.get $result) ${maskval}))
+(local.set $expected (v128.and (local.get $expected) ${maskval}))
+`;
+                    } else {
+                        let ty = 'i' + fn_compare_type.substring(1);
+                        maskval = `(${ty}.const ${maskval})`;
+                        mask = `
+(local.set $result1 (${ty}.and (${ty}.reinterpret_${fn_compare_type} (local.get $result)) ${maskval}))
+(local.set $expected1 (${ty}.and (${ty}.reinterpret_${fn_compare_type} (local.get $expected)) ${maskval}))
+`;
+                        more_locals = `(local $result1 ${ty}) (local $expected1 ${ty})`;
+                        cmp_suffix = '1';
+                    }
+                } else if (fn_compare_type == 'i64x2') {
+                    fn_compare_op = 'i32x4.eq';
+                } else {
+                    fn_compare_op = fn_compare_type + '.eq';
                 }
-                if (fn_compare_type == 'i64x2')
-                    fn_compare_type = 'i32x4';
                 let body = `
 (local $result ${fn_result_types[0]})
+(local $expected ${fn_result_types[0]})
 (local $cmpresult ${must_reduce ? "v128" : "i32"})
+${more_locals}
 (local.set $result (call $f ${fn_params.flat().map(sanitizeVal).join(' ')}))
+(local.set $expected ${fn_results[0].map(sanitizeVal).join(' ')})
 ${mask}
-(local.set $cmpresult (${fn_compare_type}.eq (local.get $result) ${fn_results[0].map(sanitizeVal).join(' ')}))
+(local.set $cmpresult (${fn_compare_op} (local.get $result${cmp_suffix}) (local.get $expected${cmp_suffix})))
 ${must_reduce ? "(i8x16.all_true (local.get $cmpresult))" : "(local.get $cmpresult)"}`;
                 mod = `
 (module
@@ -222,6 +253,31 @@ function parseInvoke(invoke_toks) {
     return [fn_name, fn_params, fn_param_types];
 }
 
+// Returns [type, is_vector, values] where type is a vector type or scalar type
+// and values is an array always.
+function parseConst(ts) {
+    let c = new Tokens(ts);
+    c.match(['(']);
+    let tok = c.get();
+    switch (tok) {
+    case 'i32.const':
+    case 'i64.const':
+    case 'f32.const':
+    case 'f64.const':
+        return [tok.substring(0,3), false, [c.get()]];
+        break;
+    case 'v128.const': {
+        let type = c.get();
+        let values = [];
+        while (!c.peek([')']))
+            values.push(c.get());
+        return [type, true, values];
+    }
+    default:
+        throw "Not a constant: " + ts;
+    }
+}
+
 // Given the tokens for a module: returns a dictionary mapping function name
 // (without double quotes) to signature {params: [type], results: [type]}.
 
@@ -231,23 +287,20 @@ function parseFunctions(ts) {
     m.match(['(', 'module']);
     while (!m.peek([')'])) {
         let next = new Tokens(m.collect());
-        if (next.peek(['(', 'func'])) {
-            next.skip(2);
+        if (next.eat(['(', 'func'])) {
             let name_toks = new Tokens(next.collect());
             if (!name_toks.peek(['(', 'export']))
                 continue;
             name_toks.skip(2);
             let name = stripString(name_toks.get());
             let params = [];
-            while (next.peek(['(', 'param'])) {
-                next.skip(2);
+            while (next.eat(['(', 'param'])) {
                 while (!next.peek([')']))
                     params.push(next.get());
                 next.skip(1);
             }
             let results = [];
-            while (next.peek(['(', 'result'])) {
-                next.skip(2);
+            while (next.eat(['(', 'result'])) {
                 while (!next.peek([')']))
                     results.push(next.get());
                 next.skip(1);
@@ -263,8 +316,7 @@ function parseFunctions(ts) {
 function formatModule(ts) {
     let m = new Tokens(ts);
     m.match(['(', 'module']);
-    if (m.peek(['quote'])) {
-        m.get();
+    if (m.eat(['quote'])) {
         let ss = "(module ";
         while (!m.peek([')'])) {
             ss += "\n";
@@ -356,23 +408,6 @@ function issep(c) {
     }
 }
 
-// The input here is ( token ... ) since for v128 consts the type is actually
-// the second token.
-
-function compareType(ct) {
-    let ts = new Tokens(ct);
-    ts.match(['(']);
-    let c = ts.get();
-    switch (c) {
-    case 'i32.const': return 'i32';
-    case 'i64.const': return 'i64';
-    case 'f32.const': return 'f32';
-    case 'f64.const': return 'f64';
-    case 'v128.const': return ts.get();
-    default: throw "Unexpected const token " + c;
-    }
-}
-
 function paramType(ct) {
     let ts = new Tokens(ct);
     ts.match(['(']);
@@ -419,6 +454,13 @@ class Tokens {
             n--;
         }
         return ts;
+    }
+    eat(ts) {
+        if (this.peek(ts)) {
+            this.skip(ts.length);
+            return true;
+        }
+        return false;
     }
     match(ts) {
         if (!this.peek(ts))
