@@ -108,7 +108,7 @@ function translate(input) {
                         fn_compare_op = must_reduce ? 'i32x4.eq' : 'i32.eq';
                         break;
                     case 'f64x2':
-                        maskval = fn_compare_values.map((x) => x.match(/nan/) ? ' 0x7FF80000 0' : ' 0xFFFFFFFF 0xFFFFFFFF').join(' ');
+                        maskval = fn_compare_values.map((x) => x.match(/nan/) ? ' 0 0x7FF80000' : ' 0xFFFFFFFF 0xFFFFFFFF').join(' ');
                         fn_compare_op = 'i32x4.eq';
                         break;
                     case 'f64':
