@@ -241,12 +241,11 @@ function translateAssertInvalid(tokens) {
         "assertEq(saved instanceof WebAssembly.CompileError, true)");
 }
 
-// Not obvious that this is what we want but these values appearing in the test
-// suite are not standard, from what I can tell.
+// Replaces nan:canonical, nan:arithmetic, and nan:0x... with just "nan", until
+// we have better logic for handling and comparing NaN values.  Also,
+// nan:canonical and nan:arithmetic is not known to `wat`.
 function sanitizeVal(v) {
-    if (v == "nan:canonical") return "nan";
-    if (v == "nan:arithmetic") return "nan";
-    return v;
+    return v.replace(/nan:[0-9a-z_]+/g, "nan");
 }
 
 function parseInvoke(invoke_toks) {
