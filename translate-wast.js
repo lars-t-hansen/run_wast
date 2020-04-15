@@ -23,123 +23,134 @@ function main() {
     if (!this.INPUT_FILE)
         throw "Error: No input file";
     let input = os.file.readFile(INPUT_FILE);
-    let output = translate(input);
-    print(output);
+    resetOutput();
+    translate(input);
+    print(getOutput());
 }
 
 function translate(input) {
-    let output = "";
-    let out = function(...ss) {
-        for ( let s of ss ) {
-            output += s;
-            output += "\n";
-        }
-    };
-
     let last_module = null;
     let last_module_funcs = null;
-
     let tokens = new Tokens(tokenize(input));
     while (!tokens.atEnd()) {
         if (tokens.peek(['(', 'module'])) {
-            // (module ...)
-            // This turns into an instance definition for subsequent tests to reference.
-            last_module = tokens.collect();
+            last_module = translateModule(tokens);
             last_module_funcs = null;
-            out("var ins = new WebAssembly.Instance(new WebAssembly.Module(wasmTextToBinary(`",
-                formatModule(last_module),
-                "`)));");
         } else if (tokens.peek(['(', 'assert_return', '(', 'invoke'])) {
-            // (assert_return (invoke fn arg ...) result ...)
-            // where each arg and each result is a T.const
-            // and the fn is bound by the preceding module
-            let ts = new Tokens(tokens.collect());
-            ts.match(['(', 'assert_return']);
-            let invoke_toks = new Tokens(ts.collect());
-            let result_toks = new Tokens(ts.collect());
-            ts.match([')']);
-            assertEq(ts.atEnd(), true);
+            translateAssertReturn(tokens);
+        } else if (tokens.peek(['(', 'assert_trap', '(', 'invoke'])) {
+            if (!last_module_funcs)
+                last_module_funcs = parseFunctions(last_module);
+            translateAssertTrap(tokens, last_module_funcs);
+        } else if (tokens.peek(['(', 'assert_malformed'])) {
+            translateAssertMalformed(tokens);
+        } else if (tokens.peek(['(', 'assert_invalid'])) {
+            translateAssertInvalid(tokens);
+        } else {
+            throw "Unexpected phrase: " + tokens.peekPrefix(10);
+        }
+    }
+}
 
-            let [fn_name, fn_params, fn_param_types] = parseInvoke(invoke_toks);
+// (module ...)
+// This turns into an instance definition for subsequent tests to reference.
+function translateModule(tokens) {
+    let mod = tokens.collect();
+    out("var ins = new WebAssembly.Instance(new WebAssembly.Module(wasmTextToBinary(`",
+        formatModule(mod),
+        "`)));");
+    return mod;
+}
 
-            let fn_results = [];
-            while (!result_toks.atEnd())
-                fn_results.push(result_toks.collect());
-            let fn_result_types = fn_results.map(resultType);
+// (assert_return (invoke fn arg ...) result ...) where each arg and each
+// result is a T.const and the fn is bound by the preceding module
+function translateAssertReturn(tokens) {
+    let ts = new Tokens(tokens.collect());
+    ts.match(['(', 'assert_return']);
+    let invoke_toks = new Tokens(ts.collect());
+    let result_toks = new Tokens(ts.collect());
+    ts.match([')']);
+    assertEq(ts.atEnd(), true);
 
-            let mod = "";
-            if (fn_result_types.length == 0) {
-                mod = `
+    let [fn_name, fn_params, fn_param_types] = parseInvoke(invoke_toks);
+
+    let fn_results = [];
+    while (!result_toks.atEnd())
+        fn_results.push(result_toks.collect());
+    let fn_result_types = fn_results.map(resultType);
+
+    let mod = "";
+    if (fn_result_types.length == 0) {
+        mod = `
 (module
   (import "" ${fn_name} (func $f (param ${fn_param_types.join(' ')})))
   (func (export "run") (result i32)
     (call $f ${fn_params.flat().map(sanitizeVal).join(' ')})
     (i32.const 1)))
 `;
-            } else if (fn_result_types.length == 1) {
-                // Comparisons and reductions are a little hacky.  We prefer the
-                // type-specific comparisons when we can, but we have no
-                // i64x2.eq, so we use i32x4.eq in this case; it is correct to
-                // do so.
-                //
-                // When the comparisons are not scalar we must reduce the result
-                // to a scalar.  We have no i64x2.all_true, for example, and
-                // none for the floats anyway.  But we can always use i8x16 to
-                // reduce because we know a lane is either 0 or -1, and if we
-                // really mean all_true then we really mean all_bits_set here.
-                //
-                // For NaN we mask the result and the expected value and compare
-                // as ints (thus ignoring sign and payload).  This is close
-                // enough to being right for now.
-                let [fn_compare_type, must_reduce, fn_compare_values] = parseConst(fn_results[0]);
-                let has_nan = fn_compare_values.some((x) => x.match(/nan/));
-                let mask = "";
-                let more_locals = "";
-                let cmp_suffix = "";
-                let fn_compare_op = "XXX";
+    } else if (fn_result_types.length == 1) {
+        // Comparisons and reductions are a little hacky.  We prefer the
+        // type-specific comparisons when we can, but we have no i64x2.eq, so we
+        // use i32x4.eq in this case; it is correct to do so.
+        //
+        // When the comparisons are not scalar we must reduce the result to a
+        // scalar.  We have no i64x2.all_true, for example, and none for the
+        // floats anyway.  But we can always use i8x16 to reduce because we know
+        // a lane is either 0 or -1, and if we really mean all_true then we
+        // really mean all_bits_set here.
+        //
+        // For NaN we mask the result and the expected value and compare as ints
+        // (thus ignoring sign and payload).  This is close enough to being
+        // right for now.
+        let [fn_compare_type, must_reduce, fn_compare_values] = parseConst(fn_results[0]);
+        let has_nan = fn_compare_values.some((x) => x.match(/nan/));
+        let mask = "";
+        let more_locals = "";
+        let cmp_suffix = "";
+        let fn_compare_op = "XXX";
 
-                if (has_nan) {
-                    let maskval = "";
-                    fn_compare_val = "";
-                    switch (fn_compare_type) {
-                    case 'f32x4':
-                    case 'f32':
-                        maskval = fn_compare_values.map((x) => x.match(/nan/) ? ' 0x7FC00000' : ' 0xFFFFFFFF').join(' ');
-                        fn_compare_op = must_reduce ? 'i32x4.eq' : 'i32.eq';
-                        break;
-                    case 'f64x2':
-                        maskval = fn_compare_values.map((x) => x.match(/nan/) ? ' 0 0x7FF80000' : ' 0xFFFFFFFF 0xFFFFFFFF').join(' ');
-                        fn_compare_op = 'i32x4.eq';
-                        break;
-                    case 'f64':
-                        maskval = fn_compare_values[0].match(/nan/) ? ' 0x7FF80000' : ' 0xFFFFFFFF';
-                        fn_compare_op = 'i64.eq';
-                        break;
-                    default:
-                        throw "Not an acceptable type for has_nan: " + fn_compare_type;
-                    }
-                    if (must_reduce) {
-                        maskval = `(v128.const i32x4 ${maskval})`;
-                        mask = `
+        if (has_nan) {
+            let maskval = "";
+            fn_compare_val = "";
+            switch (fn_compare_type) {
+            case 'f32x4':
+            case 'f32':
+                maskval = fn_compare_values.map((x) => x.match(/nan/) ? ' 0x7FC00000' : ' 0xFFFFFFFF').join(' ');
+                fn_compare_op = must_reduce ? 'i32x4.eq' : 'i32.eq';
+                break;
+            case 'f64x2':
+                maskval = fn_compare_values.map((x) => x.match(/nan/) ? ' 0 0x7FF80000' : ' 0xFFFFFFFF 0xFFFFFFFF').join(' ');
+                fn_compare_op = 'i32x4.eq';
+                break;
+            case 'f64':
+                maskval = fn_compare_values[0].match(/nan/) ? ' 0x7FF80000' : ' 0xFFFFFFFF';
+                fn_compare_op = 'i64.eq';
+                break;
+            default:
+                throw "Not an acceptable type for has_nan: " + fn_compare_type;
+            }
+            if (must_reduce) {
+                maskval = `(v128.const i32x4 ${maskval})`;
+                mask = `
 (local.set $result (v128.and (local.get $result) ${maskval}))
 (local.set $expected (v128.and (local.get $expected) ${maskval}))
 `;
-                    } else {
-                        let ty = 'i' + fn_compare_type.substring(1);
-                        maskval = `(${ty}.const ${maskval})`;
-                        mask = `
+            } else {
+                let ty = 'i' + fn_compare_type.substring(1);
+                maskval = `(${ty}.const ${maskval})`;
+                mask = `
 (local.set $result1 (${ty}.and (${ty}.reinterpret_${fn_compare_type} (local.get $result)) ${maskval}))
 (local.set $expected1 (${ty}.and (${ty}.reinterpret_${fn_compare_type} (local.get $expected)) ${maskval}))
 `;
-                        more_locals = `(local $result1 ${ty}) (local $expected1 ${ty})`;
-                        cmp_suffix = '1';
-                    }
-                } else if (fn_compare_type == 'i64x2') {
-                    fn_compare_op = 'i32x4.eq';
-                } else {
-                    fn_compare_op = fn_compare_type + '.eq';
-                }
-                let body = `
+                more_locals = `(local $result1 ${ty}) (local $expected1 ${ty})`;
+                cmp_suffix = '1';
+            }
+        } else if (fn_compare_type == 'i64x2') {
+            fn_compare_op = 'i32x4.eq';
+        } else {
+            fn_compare_op = fn_compare_type + '.eq';
+        }
+        let body = `
 (local $result ${fn_result_types[0]})
 (local $expected ${fn_result_types[0]})
 (local $cmpresult ${must_reduce ? "v128" : "i32"})
@@ -149,39 +160,38 @@ ${more_locals}
 ${mask}
 (local.set $cmpresult (${fn_compare_op} (local.get $result${cmp_suffix}) (local.get $expected${cmp_suffix})))
 ${must_reduce ? "(i8x16.all_true (local.get $cmpresult))" : "(local.get $cmpresult)"}`;
-                mod = `
+        mod = `
 (module
   (import "" ${fn_name} (func $f (param ${fn_param_types.join(' ')}) (result ${fn_result_types.join(' ')})))
   (func (export "run") (result i32) ${body}))
 `;
-            } else {
-                // TODO: Multi-result
-                throw "Multi-result not implemented"
-            }
+    } else {
+        // TODO: Multi-result
+        throw "Multi-result not implemented"
+    }
 
-            out("var run = new WebAssembly.Instance(new WebAssembly.Module(wasmTextToBinary(`",
-                mod,
-                "`)), {'':ins.exports});",
-                "assertEq(run.exports.run(), 1)");
-        } else if (tokens.peek(['(', 'assert_trap', '(', 'invoke'])) {
-            // (assert_trap (invoke fn arg ...) errormsg)
-            // where each arg is a const
-            // and the fn is bound by the preceding module
-            let ts = new Tokens(tokens.collect());
-            ts.match(['(', 'assert_trap']);
-            let invoke_toks = new Tokens(ts.collect());
-            let error_msg = ts.matchString();
-            ts.match([')']);
-            assertEq(ts.atEnd(), true);
+    out("var run = new WebAssembly.Instance(new WebAssembly.Module(wasmTextToBinary(`",
+        mod,
+        "`)), {'':ins.exports});",
+        "assertEq(run.exports.run(), 1)");
+}
 
-            if (!last_module_funcs)
-                last_module_funcs = parseFunctions(last_module);
+// (assert_trap (invoke fn arg ...) errormsg) where each arg is a const and the
+// fn is bound by the preceding module
+function translateAssertTrap(tokens, last_module_funcs) {
+    let ts = new Tokens(tokens.collect());
+    ts.match(['(', 'assert_trap']);
+    let invoke_toks = new Tokens(ts.collect());
+    let error_msg = ts.matchString();
+    ts.match([')']);
+    assertEq(ts.atEnd(), true);
 
-            let [fn_name, fn_params, fn_param_types] = parseInvoke(invoke_toks);
-            let signature = last_module_funcs[stripString(fn_name)];
 
-            out("var run = new WebAssembly.Instance(new WebAssembly.Module(wasmTextToBinary(`",
-                `
+    let [fn_name, fn_params, fn_param_types] = parseInvoke(invoke_toks);
+    let signature = last_module_funcs[stripString(fn_name)];
+
+    out("var run = new WebAssembly.Instance(new WebAssembly.Module(wasmTextToBinary(`",
+        `
 (module
   (import "" ${fn_name} (func $f ${signature.params.length ? `(param ${signature.params.join(' ')})` : ''}
                                  ${signature.results.length ? `(result ${signature.results.join(' ')})` : ''}))
@@ -189,47 +199,46 @@ ${must_reduce ? "(i8x16.all_true (local.get $cmpresult))" : "(local.get $cmpresu
     (call $f ${fn_params.flat().join(' ')})
     ${signature.results.length > 0 ? 'drop' : ''}))
 `,
-                "`)), {'':ins.exports});",
-                "var thrown = false;",
-                "try { run.exports.run() } catch (e) { thrown = true; }",
-                "if (!thrown) throw 'Error: expected exception';");
-        } else if (tokens.peek(['(', 'assert_malformed'])) {
-            // (assert_malformed module error)
-            let ts = new Tokens(tokens.collect());
-            ts.skip(2);
-            let m = ts.collect();
-            let err = ts.matchString();
-            ts.match([')']);
-            assertEq(ts.atEnd(), true);
-            out("var thrown = false;",
-                "var saved;",
-                "try { wasmTextToBinary(`",
-                formatModule(m),
-                "`) } catch (e) { thrown = true; saved = e; }",
-                "assertEq(thrown, true)",
-                "assertEq(saved instanceof SyntaxError, true)");
-        } else if (tokens.peek(['(', 'assert_invalid'])) {
-            // (assert_invalid module error)
-            let ts = new Tokens(tokens.collect());
-            ts.skip(2);
-            let m = ts.collect();
-            let err = ts.matchString();
-            ts.match([')']);
-            assertEq(ts.atEnd(), true);
-            out("var thrown = false;",
-                "var saved;",
-                "var bin = wasmTextToBinary(`",
-                formatModule(m),
-                "`);",
-                "assertEq(WebAssembly.validate(bin), false);",
-                "try { new WebAssembly.Module(bin) } catch (e) { thrown = true; saved = e; }",
-                "assertEq(thrown, true)",
-                "assertEq(saved instanceof WebAssembly.CompileError, true)");
-        } else {
-            throw "Unexpected phrase: " + tokens.peekPrefix(10);
-        }
-    }
-    return output;
+        "`)), {'':ins.exports});",
+        "var thrown = false;",
+        "try { run.exports.run() } catch (e) { thrown = true; }",
+        "if (!thrown) throw 'Error: expected exception';");
+}
+
+// (assert_malformed module error)
+function translateAssertMalformed(tokens) {
+    let ts = new Tokens(tokens.collect());
+    ts.match(['(', 'assert_malformed']);
+    let m = ts.collect();
+    let err = ts.matchString();
+    ts.match([')']);
+    assertEq(ts.atEnd(), true);
+    out("var thrown = false;",
+        "var saved;",
+        "try { wasmTextToBinary(`",
+        formatModule(m),
+        "`) } catch (e) { thrown = true; saved = e; }",
+        "assertEq(thrown, true)",
+        "assertEq(saved instanceof SyntaxError, true)");
+}
+
+// (assert_invalid module error)
+function translateAssertInvalid(tokens) {
+    let ts = new Tokens(tokens.collect());
+    ts.match(['(','assert_invalid']);
+    let m = ts.collect();
+    let err = ts.matchString();
+    ts.match([')']);
+    assertEq(ts.atEnd(), true);
+    out("var thrown = false;",
+        "var saved;",
+        "var bin = wasmTextToBinary(`",
+        formatModule(m),
+        "`);",
+        "assertEq(WebAssembly.validate(bin), false);",
+        "try { new WebAssembly.Module(bin) } catch (e) { thrown = true; saved = e; }",
+        "assertEq(thrown, true)",
+        "assertEq(saved instanceof WebAssembly.CompileError, true)");
 }
 
 // Not obvious that this is what we want but these values appearing in the test
@@ -289,23 +298,22 @@ function parseFunctions(ts) {
         let next = new Tokens(m.collect());
         if (next.eat(['(', 'func'])) {
             let name_toks = new Tokens(next.collect());
-            if (!name_toks.peek(['(', 'export']))
-                continue;
-            name_toks.skip(2);
-            let name = stripString(name_toks.get());
-            let params = [];
-            while (next.eat(['(', 'param'])) {
-                while (!next.peek([')']))
-                    params.push(next.get());
-                next.skip(1);
+            if (name_toks.eat(['(', 'export'])) {
+                let name = stripString(name_toks.get());
+                let params = [];
+                while (next.eat(['(', 'param'])) {
+                    while (!next.peek([')']))
+                        params.push(next.get());
+                    next.match([')']);
+                }
+                let results = [];
+                while (next.eat(['(', 'result'])) {
+                    while (!next.peek([')']))
+                        results.push(next.get());
+                    next.match([')']);
+                }
+                signatures[name] = {params, results}
             }
-            let results = [];
-            while (next.eat(['(', 'result'])) {
-                while (!next.peek([')']))
-                    results.push(next.get());
-                next.skip(1);
-            }
-            signatures[name] = {params, results}
         }
     }
     m.match([')']);
@@ -501,6 +509,23 @@ class Tokens {
     assertAvail(n) {
         if (this.i + n > this.lim)
             throw "Not enough tokens: " + n;
+    }
+}
+
+var _output_ = "";
+
+function resetOutput() {
+    _output_ = "";
+}
+
+function getOutput() {
+    return _output_;
+}
+
+function out(...ss) {
+    for ( let s of ss ) {
+        _output_ += s;
+        _output_ += "\n";
     }
 }
 
